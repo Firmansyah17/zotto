@@ -290,7 +290,7 @@ def main():
     log(f"👛 Wallet: {WALLET}\n")
 
     ankr_bal, _ = cek_balance()
-    if ankr_bal < SWAP_AMOUNT_ANKR * 2:
+    if ankr_bal < SWAP_AMOUNT_ANKR * 1:
         log(f"❌ Balance ANKR tidak cukup! Minimal butuh {SWAP_AMOUNT_ANKR * 2} ANKR")
         return
 
