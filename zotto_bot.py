@@ -184,7 +184,7 @@ def swap_ankr_ke_usdt(ankr_amount):
 
     # exactInputSingle: WANKR → USDT, recipient langsung wallet
     swap_data = router.encode_abi(
-        fn_name="exactInputSingle",
+        "exactInputSingle",
         args=[(
             Web3.to_checksum_address(WANKR_TOKEN),
             Web3.to_checksum_address(USDT_TOKEN),
@@ -224,7 +224,7 @@ def swap_usdt_ke_ankr():
 
     # Step 1: USDT → WANKR, recipient = router (untuk di-unwrap)
     swap_data = router.encode_abi(
-        fn_name="exactInputSingle",
+        "exactInputSingle",
         args=[(
             Web3.to_checksum_address(USDT_TOKEN),
             Web3.to_checksum_address(WANKR_TOKEN),
@@ -238,7 +238,7 @@ def swap_usdt_ke_ankr():
 
     # Step 2: unwrap WANKR → ANKR native ke wallet
     unwrap_data = router.encode_abi(
-        fn_name="unwrapWETH9",
+        "unwrapWETH9",
         args=[0, WALLET]
     )
 
