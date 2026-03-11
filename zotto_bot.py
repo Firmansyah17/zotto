@@ -1,14 +1,8 @@
 """
 ╔══════════════════════════════════════════════════════╗
 ║       ZOTTO AUTO SWAP BOT — Neura Testnet            ║
-║  Otomatis swap ANKR ↔ MOLLY buat farming volume      ║
+║  Otomatis swap ANKR ↔ USDT (Uniswap V3 style)       ║
 ╚══════════════════════════════════════════════════════╝
-
-CARA PAKAI:
-1. Install dependency:  pip install web3 python-dotenv
-2. Isi file .env dengan PRIVATE_KEY kamu
-3. Isi CONTRACT ADDRESSES di bawah (lihat SETUP_BOT.md)
-4. Jalankan: python zotto_bot.py
 """
 
 import os
@@ -21,61 +15,76 @@ from datetime import datetime
 load_dotenv()
 
 # ════════════════════════════════════════════
-# ⚙️  KONFIGURASI — EDIT BAGIAN INI
+# ⚙️  KONFIGURASI
 # ════════════════════════════════════════════
 
-# Neura Testnet
-RPC_URL = "https://testnet.rpc.neuraprotocol.io"
+RPC_URL  = "https://testnet.rpc.neuraprotocol.io"
 CHAIN_ID = 267
 
-# Contract addresses — isi sesuai SETUP_BOT.md
-ZOTTO_ROUTER   = "0x6836F8A9a66ab8430224aa9b4E6D24dc8d7d5d77"   # Zotto Router
-MOLLY_TOKEN    = "0x3A631ee99eF7fE2D248116982b14e7615ac77502"    # Token MOLLY
-WANKR_TOKEN    = "0x422F5Eae5fEE0227FB31F149E690a73C4aD02dB8"    # Wrapped ANKR (WANKR)
+# Contract addresses (sudah diverifikasi dari explorer)
+ZOTTO_ROUTER = "0x6836F8A9a66ab8430224aa9b4E6D24dc8d7d5d77"
+USDT_TOKEN   = "0x3A631ee99eF7fE2D248116982b14e7615ac77502"  # Tether USD
+WANKR_TOKEN  = "0x422F5Eae5fEE0227FB31F149E690a73C4aD02dB8"  # Wrapped ANKR
+
+# Fee tier — coba urutan ini kalau gagal: 3000 → 500 → 10000
+FEE_TIER = 3000
 
 # Pengaturan swap
-SWAP_AMOUNT_ANKR = 55        # Jumlah ANKR per swap (sesuaikan dengan balance kamu)
-DELAY_ANTAR_SWAP = 15         # Jeda antar swap dalam detik (jangan terlalu cepat)
-TARGET_VOLUME_USD = 1000      # Target volume dalam USD ($1K atau $10K)
-HARGA_ANKR_USD   = 0.04       # Perkiraan harga ANKR/USD (update kalau perlu)
+SWAP_AMOUNT_ANKR = 55       # Jumlah ANKR per swap
+DELAY_ANTAR_SWAP = 15       # Jeda antar swap (detik)
+TARGET_VOLUME_USD = 1000    # Target volume USD
+HARGA_ANKR_USD   = 0.004338 # Harga ANKR saat ini
 
 # ════════════════════════════════════════════
-# ABI — Uniswap V2 Router (Zotto pakai format ini)
+# ABI
 # ════════════════════════════════════════════
 
 ROUTER_ABI = json.loads('''[
   {
-    "name": "swapExactETHForTokens",
+    "name": "multicall",
     "type": "function",
+    "stateMutability": "payable",
     "inputs": [
-      {"name": "amountOutMin", "type": "uint256"},
-      {"name": "path", "type": "address[]"},
-      {"name": "to", "type": "address"},
-      {"name": "deadline", "type": "uint256"}
+      {"name": "deadline", "type": "uint256"},
+      {"name": "data",     "type": "bytes[]"}
     ],
-    "outputs": [{"name": "amounts", "type": "uint256[]"}]
+    "outputs": [{"name": "results", "type": "bytes[]"}]
   },
   {
-    "name": "swapExactTokensForETH",
+    "name": "exactInputSingle",
     "type": "function",
-    "inputs": [
-      {"name": "amountIn", "type": "uint256"},
-      {"name": "amountOutMin", "type": "uint256"},
-      {"name": "path", "type": "address[]"},
-      {"name": "to", "type": "address"},
-      {"name": "deadline", "type": "uint256"}
-    ],
-    "outputs": [{"name": "amounts", "type": "uint256[]"}]
+    "stateMutability": "payable",
+    "inputs": [{
+      "name": "params",
+      "type": "tuple",
+      "components": [
+        {"name": "tokenIn",           "type": "address"},
+        {"name": "tokenOut",          "type": "address"},
+        {"name": "fee",               "type": "uint24"},
+        {"name": "recipient",         "type": "address"},
+        {"name": "amountIn",          "type": "uint256"},
+        {"name": "amountOutMinimum",  "type": "uint256"},
+        {"name": "sqrtPriceLimitX96", "type": "uint160"}
+      ]
+    }],
+    "outputs": [{"name": "amountOut", "type": "uint256"}]
   },
   {
-    "name": "getAmountsOut",
+    "name": "unwrapWETH9",
     "type": "function",
+    "stateMutability": "payable",
     "inputs": [
-      {"name": "amountIn", "type": "uint256"},
-      {"name": "path", "type": "address[]"}
+      {"name": "amountMinimum", "type": "uint256"},
+      {"name": "recipient",     "type": "address"}
     ],
-    "outputs": [{"name": "amounts", "type": "uint256[]"}],
-    "stateMutability": "view"
+    "outputs": []
+  },
+  {
+    "name": "refundETH",
+    "type": "function",
+    "stateMutability": "payable",
+    "inputs":  [],
+    "outputs": []
   }
 ]''')
 
@@ -85,26 +94,26 @@ ERC20_ABI = json.loads('''[
     "type": "function",
     "inputs": [
       {"name": "spender", "type": "address"},
-      {"name": "amount", "type": "uint256"}
+      {"name": "amount",  "type": "uint256"}
     ],
     "outputs": [{"name": "", "type": "bool"}]
   },
   {
     "name": "balanceOf",
     "type": "function",
-    "inputs": [{"name": "account", "type": "address"}],
-    "outputs": [{"name": "", "type": "uint256"}],
-    "stateMutability": "view"
+    "stateMutability": "view",
+    "inputs":  [{"name": "account", "type": "address"}],
+    "outputs": [{"name": "",        "type": "uint256"}]
   },
   {
     "name": "allowance",
     "type": "function",
+    "stateMutability": "view",
     "inputs": [
-      {"name": "owner", "type": "address"},
+      {"name": "owner",   "type": "address"},
       {"name": "spender", "type": "address"}
     ],
-    "outputs": [{"name": "", "type": "uint256"}],
-    "stateMutability": "view"
+    "outputs": [{"name": "", "type": "uint256"}]
   }
 ]''')
 
@@ -122,134 +131,136 @@ account = w3.eth.account.from_key(PRIVATE_KEY)
 WALLET  = account.address
 
 router = w3.eth.contract(address=Web3.to_checksum_address(ZOTTO_ROUTER), abi=ROUTER_ABI)
-molly  = w3.eth.contract(address=Web3.to_checksum_address(MOLLY_TOKEN),  abi=ERC20_ABI)
+usdt   = w3.eth.contract(address=Web3.to_checksum_address(USDT_TOKEN),   abi=ERC20_ABI)
 
 # ════════════════════════════════════════════
-# FUNGSI UTAMA
+# HELPER
 # ════════════════════════════════════════════
 
 def log(msg):
-    """Print dengan timestamp"""
-    waktu = datetime.now().strftime("%H:%M:%S")
-    print(f"[{waktu}] {msg}")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
 def cek_balance():
-    """Cek balance ANKR dan MOLLY"""
-    ankr_wei  = w3.eth.get_balance(WALLET)
-    molly_wei = molly.functions.balanceOf(WALLET).call()
-    ankr      = w3.from_wei(ankr_wei, "ether")
-    molly_bal = w3.from_wei(molly_wei, "ether")
-    log(f"💰 Balance — ANKR: {ankr:.4f} | MOLLY: {molly_bal:.4f}")
-    return float(ankr), float(molly_bal)
+    ankr_wei = w3.eth.get_balance(WALLET)
+    usdt_wei = usdt.functions.balanceOf(WALLET).call()
+    ankr_bal = float(w3.from_wei(ankr_wei, "ether"))
+    usdt_bal = float(usdt_wei) / 1e6  # USDT decimals = 6
+    log(f"💰 Balance — ANKR: {ankr_bal:.4f} | USDT: {usdt_bal:.4f}")
+    return ankr_bal, usdt_bal
 
-def approve_molly(amount_wei):
-    """Approve MOLLY agar bisa dijual ke router"""
-    allowance = molly.functions.allowance(WALLET, ZOTTO_ROUTER).call()
+def kirim_tx(tx_built):
+    nonce = w3.eth.get_transaction_count(WALLET)
+    tx_built["nonce"] = nonce
+    signed  = w3.eth.account.sign_transaction(tx_built, PRIVATE_KEY)
+    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+    return receipt.status == 1, tx_hash.hex()
+
+def approve_token(token_contract, spender, amount_wei):
+    allowance = token_contract.functions.allowance(WALLET, spender).call()
     if allowance >= amount_wei:
-        return  # Sudah di-approve
-
-    log("🔓 Approve MOLLY ke router...")
-    nonce = w3.eth.get_transaction_count(WALLET)
-    tx = molly.functions.approve(
-        Web3.to_checksum_address(ZOTTO_ROUTER),
-        2**256 - 1  # approve max supaya tidak perlu approve lagi
+        return
+    log("🔓 Approving USDT...")
+    tx = token_contract.functions.approve(
+        Web3.to_checksum_address(spender),
+        2**256 - 1
     ).build_transaction({
-        "chainId": CHAIN_ID,
-        "gas": 100000,
+        "chainId":  CHAIN_ID,
+        "gas":      100000,
         "gasPrice": w3.eth.gas_price,
-        "nonce": nonce,
+        "from":     WALLET,
     })
-    signed = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    w3.eth.wait_for_transaction_receipt(tx_hash)
-    log(f"✅ Approve berhasil: {tx_hash.hex()}")
+    ok, txh = kirim_tx(tx)
+    log(f"{'✅' if ok else '❌'} Approve: {txh[:16]}...")
 
-def swap_ankr_ke_molly(ankr_amount):
-    """Swap ANKR (native) → MOLLY"""
-    amount_in_wei = w3.to_wei(ankr_amount, "ether")
-    deadline      = int(time.time()) + 300  # 5 menit
+# ════════════════════════════════════════════
+# SWAP FUNCTIONS
+# ════════════════════════════════════════════
 
-    path = [
-        Web3.to_checksum_address(WANKR_TOKEN),
-        Web3.to_checksum_address(MOLLY_TOKEN)
-    ]
+def swap_ankr_ke_usdt(ankr_amount):
+    """ANKR native → USDT via V3 multicall"""
+    amount_in = w3.to_wei(ankr_amount, "ether")
+    deadline  = int(time.time()) + 300
 
-    # Hitung estimasi output
-    try:
-        amounts = router.functions.getAmountsOut(amount_in_wei, path).call()
-        min_out = int(amounts[1] * 0.95)  # 5% slippage tolerance
-    except:
-        min_out = 0
+    # exactInputSingle: WANKR → USDT, recipient langsung wallet
+    swap_data = router.encodeABI(
+        fn_name="exactInputSingle",
+        args=[(
+            Web3.to_checksum_address(WANKR_TOKEN),
+            Web3.to_checksum_address(USDT_TOKEN),
+            FEE_TIER,
+            WALLET,      # terima USDT langsung
+            amount_in,
+            0,           # amountOutMinimum = 0 (testnet, ok)
+            0            # sqrtPriceLimitX96
+        )]
+    )
 
-    nonce = w3.eth.get_transaction_count(WALLET)
-    tx = router.functions.swapExactETHForTokens(
-        min_out,
-        path,
-        WALLET,
-        deadline
+    tx = router.functions.multicall(
+        deadline,
+        [swap_data]
     ).build_transaction({
-        "chainId": CHAIN_ID,
-        "value": amount_in_wei,
-        "gas": 200000,
+        "chainId":  CHAIN_ID,
+        "value":    amount_in,  # kirim ANKR native
+        "gas":      300000,
         "gasPrice": w3.eth.gas_price,
-        "nonce": nonce,
+        "from":     WALLET,
     })
 
-    signed  = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+    ok, txh = kirim_tx(tx)
+    log(f"{'✅' if ok else '❌'} ANKR→USDT | {ankr_amount} ANKR | tx: {txh[:16]}...")
+    return ok
 
-    status = "✅" if receipt.status == 1 else "❌"
-    log(f"{status} ANKR→MOLLY | {ankr_amount} ANKR | tx: {tx_hash.hex()[:16]}...")
-    return receipt.status == 1
-
-def swap_molly_ke_ankr():
-    """Swap semua MOLLY → ANKR (native)"""
-    molly_balance = molly.functions.balanceOf(WALLET).call()
-    if molly_balance == 0:
-        log("⚠️  Tidak ada MOLLY untuk dijual")
+def swap_usdt_ke_ankr():
+    """USDT → ANKR native via V3 multicall + unwrapWETH9"""
+    usdt_balance = usdt.functions.balanceOf(WALLET).call()
+    if usdt_balance == 0:
+        log("⚠️  Tidak ada USDT")
         return False
 
-    approve_molly(molly_balance)
+    approve_token(usdt, ZOTTO_ROUTER, usdt_balance)
 
     deadline = int(time.time()) + 300
-    path = [
-        Web3.to_checksum_address(MOLLY_TOKEN),
-        Web3.to_checksum_address(WANKR_TOKEN)
-    ]
 
-    try:
-        amounts = router.functions.getAmountsOut(molly_balance, path).call()
-        min_out = int(amounts[1] * 0.95)
-    except:
-        min_out = 0
+    # Step 1: USDT → WANKR, recipient = router (untuk di-unwrap)
+    swap_data = router.encodeABI(
+        fn_name="exactInputSingle",
+        args=[(
+            Web3.to_checksum_address(USDT_TOKEN),
+            Web3.to_checksum_address(WANKR_TOKEN),
+            FEE_TIER,
+            Web3.to_checksum_address(ZOTTO_ROUTER),  # router dulu
+            usdt_balance,
+            0,
+            0
+        )]
+    )
 
-    nonce = w3.eth.get_transaction_count(WALLET)
-    tx = router.functions.swapExactTokensForETH(
-        molly_balance,
-        min_out,
-        path,
-        WALLET,
-        deadline
+    # Step 2: unwrap WANKR → ANKR native ke wallet
+    unwrap_data = router.encodeABI(
+        fn_name="unwrapWETH9",
+        args=[0, WALLET]
+    )
+
+    tx = router.functions.multicall(
+        deadline,
+        [swap_data, unwrap_data]
     ).build_transaction({
-        "chainId": CHAIN_ID,
-        "gas": 200000,
+        "chainId":  CHAIN_ID,
+        "value":    0,
+        "gas":      350000,
         "gasPrice": w3.eth.gas_price,
-        "nonce": nonce,
+        "from":     WALLET,
     })
 
-    signed  = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
-
-    status = "✅" if receipt.status == 1 else "❌"
-    log(f"{status} MOLLY→ANKR | tx: {tx_hash.hex()[:16]}...")
-    return receipt.status == 1
+    ok, txh = kirim_tx(tx)
+    log(f"{'✅' if ok else '❌'} USDT→ANKR | tx: {txh[:16]}...")
+    return ok
 
 def update_progress(swap_ke, volume_terkumpul, target):
-    """Update file progress.md"""
-    persen  = min(100, (volume_terkumpul / target) * 100)
-    isi = f"""# 🤖 Zotto Bot Progress
+    persen = min(100, (volume_terkumpul / target) * 100)
+    with open("progress.md", "w") as f:
+        f.write(f"""# 🤖 Zotto Bot Progress
 
 **Wallet:** `{WALLET}`
 **Last Update:** {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
@@ -258,22 +269,14 @@ def update_progress(swap_ke, volume_terkumpul, target):
 
 | Target | Terkumpul | Progress |
 |--------|-----------|----------|
-| ${target:,.0f} | ${volume_terkumpul:,.2f} | {persen:.1f}% |
+| ${target:,.0f} | ${volume_terkumpul:,.4f} | {persen:.1f}% |
 
 ## 📈 Statistik
-
-- Total swap selesai: **{swap_ke}x**
-- Volume per swap: **~${SWAP_AMOUNT_ANKR * HARGA_ANKR_USD * 2:.2f}**
-
-## 📝 Log Terakhir
-
-Swap terakhir: {datetime.now().strftime("%H:%M:%S")}
-"""
-    with open("progress.md", "w") as f:
-        f.write(isi)
+- Total swap: **{swap_ke}x**
+""")
 
 # ════════════════════════════════════════════
-# MAIN — LOOP UTAMA
+# MAIN
 # ════════════════════════════════════════════
 
 def main():
@@ -281,57 +284,52 @@ def main():
     print("║     ZOTTO AUTO SWAP BOT — Mulai!     ║")
     print("╚══════════════════════════════════════╝\n")
 
-    # Validasi koneksi
     if not w3.is_connected():
-        log("❌ Gagal konek ke Neura Testnet. Cek RPC URL.")
+        log("❌ Gagal konek ke Neura Testnet.")
         return
 
     log(f"✅ Terhubung ke Neura Testnet (Chain ID: {CHAIN_ID})")
     log(f"👛 Wallet: {WALLET}\n")
 
     ankr_bal, _ = cek_balance()
-    if ankr_bal < SWAP_AMOUNT_ANKR * 1:
-        log(f"❌ Balance ANKR tidak cukup! Minimal butuh {SWAP_AMOUNT_ANKR * 2} ANKR")
+    if ankr_bal < SWAP_AMOUNT_ANKR + 1:
+        log(f"❌ Balance tidak cukup. Perlu minimal {SWAP_AMOUNT_ANKR + 1} ANKR")
         return
 
-    # Hitung berapa swap yang dibutuhkan
-    volume_per_putaran = SWAP_AMOUNT_ANKR * HARGA_ANKR_USD * 2  # ANKR→MOLLY + MOLLY→ANKR
+    volume_per_putaran = SWAP_AMOUNT_ANKR * HARGA_ANKR_USD * 2
     putaran_dibutuhkan = int(TARGET_VOLUME_USD / volume_per_putaran) + 1
     log(f"📋 Target: ${TARGET_VOLUME_USD:,} | Estimasi putaran: {putaran_dibutuhkan}x\n")
 
-    volume_terkumpul = 0
+    volume_terkumpul = 0.0
     swap_ke = 0
 
     for i in range(putaran_dibutuhkan):
         log(f"── Putaran {i+1}/{putaran_dibutuhkan} ──")
 
-        # Swap 1: ANKR → MOLLY
-        if swap_ankr_ke_molly(SWAP_AMOUNT_ANKR):
+        if swap_ankr_ke_usdt(SWAP_AMOUNT_ANKR):
             volume_terkumpul += SWAP_AMOUNT_ANKR * HARGA_ANKR_USD
             swap_ke += 1
             time.sleep(DELAY_ANTAR_SWAP)
 
-            # Swap 2: MOLLY → ANKR
-            if swap_molly_ke_ankr():
+            if swap_usdt_ke_ankr():
                 volume_terkumpul += SWAP_AMOUNT_ANKR * HARGA_ANKR_USD
                 swap_ke += 1
 
-        log(f"📊 Volume terkumpul: ${volume_terkumpul:.2f} / ${TARGET_VOLUME_USD:,}")
+        log(f"📊 Volume: ${volume_terkumpul:.4f} / ${TARGET_VOLUME_USD:,}")
         update_progress(swap_ke, volume_terkumpul, TARGET_VOLUME_USD)
 
         if volume_terkumpul >= TARGET_VOLUME_USD:
             log(f"\n🎉 TARGET TERCAPAI! Total swap: {swap_ke}x")
             break
 
-        # Cek balance masih cukup
         ankr_bal, _ = cek_balance()
-        if ankr_bal < SWAP_AMOUNT_ANKR:
+        if ankr_bal < SWAP_AMOUNT_ANKR + 0.5:
             log("⚠️  Balance ANKR hampir habis, bot berhenti.")
             break
 
         time.sleep(DELAY_ANTAR_SWAP)
 
-    log("\n✅ Bot selesai! Cek progress.md untuk detail.")
+    log("\n✅ Bot selesai!")
 
 if __name__ == "__main__":
     main()
