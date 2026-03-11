@@ -25,9 +25,7 @@ ZOTTO_ROUTER = "0x6836F8A9a66ab8430224aa9b4E6D24dc8d7d5d77"
 USDT_TOKEN   = "0x3A631ee99eF7fE2D248116982b14e7615ac77502"
 WANKR_TOKEN  = "0x422F5Eae5fEE0227FB31F149E690a73C4aD02dB8"
 
-# Bot akan coba semua fee tier ini secara otomatis
-FEE_TIERS    = [500, 3000, 10000]
-FEE_TIER     = 500  # akan di-update otomatis saat berhasil
+FEE_TIER = 0  # ← dari raw trace, fee = 0
 
 SWAP_AMOUNT_ANKR = 55
 DELAY_ANTAR_SWAP = 15
@@ -35,7 +33,9 @@ TARGET_VOLUME_USD = 1000
 HARGA_ANKR_USD   = 0.004338
 
 # ════════════════════════════════════════════
-# ABI
+# ABI — sesuai raw trace
+# multicall(bytes[])          ← tanpa deadline di luar
+# exactInputSingle dengan 8 field (ada deadline di dalam struct)
 # ════════════════════════════════════════════
 
 ROUTER_ABI = json.loads('''[
@@ -44,8 +44,7 @@ ROUTER_ABI = json.loads('''[
     "type": "function",
     "stateMutability": "payable",
     "inputs": [
-      {"name": "deadline", "type": "uint256"},
-      {"name": "data",     "type": "bytes[]"}
+      {"name": "data", "type": "bytes[]"}
     ],
     "outputs": [{"name": "results", "type": "bytes[]"}]
   },
@@ -61,6 +60,7 @@ ROUTER_ABI = json.loads('''[
         {"name": "tokenOut",          "type": "address"},
         {"name": "fee",               "type": "uint24"},
         {"name": "recipient",         "type": "address"},
+        {"name": "deadline",          "type": "uint256"},
         {"name": "amountIn",          "type": "uint256"},
         {"name": "amountOutMinimum",  "type": "uint256"},
         {"name": "sqrtPriceLimitX96", "type": "uint160"}
@@ -76,6 +76,13 @@ ROUTER_ABI = json.loads('''[
       {"name": "amountMinimum", "type": "uint256"},
       {"name": "recipient",     "type": "address"}
     ],
+    "outputs": []
+  },
+  {
+    "name": "refundETH",
+    "type": "function",
+    "stateMutability": "payable",
+    "inputs":  [],
     "outputs": []
   }
 ]''')
@@ -169,80 +176,96 @@ def approve_token(token_contract, spender, amount_wei):
 # SWAP FUNCTIONS
 # ════════════════════════════════════════════
 
-def encode_swap(token_in, token_out, fee, recipient, amount_in):
-    """Encode exactInputSingle params"""
-    return router.encode_abi(
+def swap_ankr_ke_usdt(ankr_amount):
+    """
+    ANKR native → USDT
+    Kirim ETH sebagai value, router wrap otomatis jadi WANKR lalu swap ke USDT
+    recipient = WALLET langsung (tidak perlu unwrap karena dapat USDT)
+    """
+    amount_in = w3.to_wei(ankr_amount, "ether")
+    deadline  = int(time.time()) + 300
+
+    swap_data = router.encode_abi(
         "exactInputSingle",
         args=[(
-            Web3.to_checksum_address(token_in),
-            Web3.to_checksum_address(token_out),
-            fee,
-            Web3.to_checksum_address(recipient),
-            amount_in,
-            0,
-            0
+            Web3.to_checksum_address(WANKR_TOKEN),  # tokenIn
+            Web3.to_checksum_address(USDT_TOKEN),   # tokenOut
+            FEE_TIER,                                # fee = 0
+            WALLET,                                  # recipient langsung
+            deadline,                                # deadline di dalam struct
+            amount_in,                               # amountIn
+            0,                                       # amountOutMinimum
+            0                                        # sqrtPriceLimitX96
         )]
     )
 
-def swap_ankr_ke_usdt(ankr_amount):
-    """ANKR native → USDT, otomatis coba semua fee tier"""
-    global FEE_TIER
-    amount_in = w3.to_wei(ankr_amount, "ether")
+    # refundETH untuk kembalikan sisa ETH kalau ada
+    refund_data = router.encode_abi("refundETH", args=[])
 
-    # Kalau fee tier sudah ditemukan sebelumnya, langsung pakai
-    fees_to_try = [FEE_TIER] if FEE_TIER in FEE_TIERS else FEE_TIERS
+    tx = router.functions.multicall(
+        [swap_data, refund_data]  # multicall(bytes[]) tanpa deadline di luar
+    ).build_transaction({
+        "chainId":  CHAIN_ID,
+        "value":    amount_in,
+        "gas":      300000,
+        "gasPrice": w3.eth.gas_price,
+        "from":     WALLET,
+    })
 
-    for fee in fees_to_try:
-        deadline = int(time.time()) + 300
-        try:
-            swap_data = encode_swap(WANKR_TOKEN, USDT_TOKEN, fee, WALLET, amount_in)
-            tx = router.functions.multicall(deadline, [swap_data]).build_transaction({
-                "chainId":  CHAIN_ID,
-                "value":    amount_in,
-                "gas":      300000,
-                "gasPrice": w3.eth.gas_price,
-                "from":     WALLET,
-            })
-            ok, txh = kirim_tx(tx)
-            log(f"{'✅' if ok else '❌'} ANKR→USDT | fee={fee} | tx: {txh[:16]}...")
-            if ok:
-                FEE_TIER = fee
-                return True
-            # Kalau gagal, coba fee berikutnya (kecuali sudah pakai fee yang terbukti)
-            if len(fees_to_try) == 1:
-                break
-        except Exception as e:
-            log(f"⚠️  fee={fee} exception: {str(e)[:80]}")
-    return False
+    ok, txh = kirim_tx(tx)
+    log(f"{'✅' if ok else '❌'} ANKR→USDT | {ankr_amount} ANKR | tx: {txh[:16]}...")
+    return ok
 
 def swap_usdt_ke_ankr():
-    """USDT → ANKR native"""
+    """
+    USDT → ANKR native
+    recipient = address(0) → router simpan WANKR → unwrapWETH9 → ANKR ke wallet
+    """
     usdt_balance = usdt.functions.balanceOf(WALLET).call()
     if usdt_balance == 0:
         log("⚠️  Tidak ada USDT")
         return False
 
     approve_token(usdt, ZOTTO_ROUTER, usdt_balance)
+
     deadline = int(time.time()) + 300
 
-    try:
-        swap_data   = encode_swap(USDT_TOKEN, WANKR_TOKEN, FEE_TIER,
-                                  ZOTTO_ROUTER, usdt_balance)
-        unwrap_data = router.encode_abi("unwrapWETH9", args=[0, WALLET])
+    # recipient = address(0) supaya WANKR hasil swap disimpan di router dulu
+    ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 
-        tx = router.functions.multicall(deadline, [swap_data, unwrap_data]).build_transaction({
-            "chainId":  CHAIN_ID,
-            "value":    0,
-            "gas":      350000,
-            "gasPrice": w3.eth.gas_price,
-            "from":     WALLET,
-        })
-        ok, txh = kirim_tx(tx)
-        log(f"{'✅' if ok else '❌'} USDT→ANKR | tx: {txh[:16]}...")
-        return ok
-    except Exception as e:
-        log(f"⚠️  USDT→ANKR exception: {str(e)[:80]}")
-        return False
+    swap_data = router.encode_abi(
+        "exactInputSingle",
+        args=[(
+            Web3.to_checksum_address(USDT_TOKEN),   # tokenIn
+            Web3.to_checksum_address(WANKR_TOKEN),  # tokenOut
+            FEE_TIER,                                # fee = 0
+            ZERO_ADDRESS,                            # recipient = 0x0 (router simpan dulu)
+            deadline,                                # deadline di dalam struct
+            usdt_balance,                            # amountIn (semua USDT)
+            0,                                       # amountOutMinimum
+            0                                        # sqrtPriceLimitX96
+        )]
+    )
+
+    # unwrapWETH9: konversi WANKR di router → ANKR native ke wallet
+    unwrap_data = router.encode_abi(
+        "unwrapWETH9",
+        args=[0, WALLET]
+    )
+
+    tx = router.functions.multicall(
+        [swap_data, unwrap_data]
+    ).build_transaction({
+        "chainId":  CHAIN_ID,
+        "value":    0,
+        "gas":      350000,
+        "gasPrice": w3.eth.gas_price,
+        "from":     WALLET,
+    })
+
+    ok, txh = kirim_tx(tx)
+    log(f"{'✅' if ok else '❌'} USDT→ANKR | tx: {txh[:16]}...")
+    return ok
 
 def update_progress(swap_ke, volume_terkumpul, target):
     persen = min(100, (volume_terkumpul / target) * 100)
@@ -260,7 +283,6 @@ def update_progress(swap_ke, volume_terkumpul, target):
 
 ## 📈 Statistik
 - Total swap: **{swap_ke}x**
-- Fee tier aktif: **{FEE_TIER}**
 """)
 
 # ════════════════════════════════════════════
@@ -286,8 +308,7 @@ def main():
 
     volume_per_putaran = SWAP_AMOUNT_ANKR * HARGA_ANKR_USD * 2
     putaran_dibutuhkan = int(TARGET_VOLUME_USD / volume_per_putaran) + 1
-    log(f"📋 Target: ${TARGET_VOLUME_USD:,} | Estimasi putaran: {putaran_dibutuhkan}x")
-    log(f"🔍 Akan mencoba fee tier: {FEE_TIERS}\n")
+    log(f"📋 Target: ${TARGET_VOLUME_USD:,} | Estimasi putaran: {putaran_dibutuhkan}x\n")
 
     volume_terkumpul = 0.0
     swap_ke = 0
