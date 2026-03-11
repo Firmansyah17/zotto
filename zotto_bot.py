@@ -21,19 +21,18 @@ load_dotenv()
 RPC_URL  = "https://testnet.rpc.neuraprotocol.io"
 CHAIN_ID = 267
 
-# Contract addresses (sudah diverifikasi dari explorer)
 ZOTTO_ROUTER = "0x6836F8A9a66ab8430224aa9b4E6D24dc8d7d5d77"
-USDT_TOKEN   = "0x3A631ee99eF7fE2D248116982b14e7615ac77502"  # Tether USD
-WANKR_TOKEN  = "0x422F5Eae5fEE0227FB31F149E690a73C4aD02dB8"  # Wrapped ANKR
+USDT_TOKEN   = "0x3A631ee99eF7fE2D248116982b14e7615ac77502"
+WANKR_TOKEN  = "0x422F5Eae5fEE0227FB31F149E690a73C4aD02dB8"
 
-# Fee tier — coba urutan ini kalau gagal: 3000 → 500 → 10000
-FEE_TIER = 3000
+# Bot akan coba semua fee tier ini secara otomatis
+FEE_TIERS    = [500, 3000, 10000]
+FEE_TIER     = 500  # akan di-update otomatis saat berhasil
 
-# Pengaturan swap
-SWAP_AMOUNT_ANKR = 55       # Jumlah ANKR per swap
-DELAY_ANTAR_SWAP = 15       # Jeda antar swap (detik)
-TARGET_VOLUME_USD = 1000    # Target volume USD
-HARGA_ANKR_USD   = 0.004338 # Harga ANKR saat ini
+SWAP_AMOUNT_ANKR = 55
+DELAY_ANTAR_SWAP = 15
+TARGET_VOLUME_USD = 1000
+HARGA_ANKR_USD   = 0.004338
 
 # ════════════════════════════════════════════
 # ABI
@@ -77,13 +76,6 @@ ROUTER_ABI = json.loads('''[
       {"name": "amountMinimum", "type": "uint256"},
       {"name": "recipient",     "type": "address"}
     ],
-    "outputs": []
-  },
-  {
-    "name": "refundETH",
-    "type": "function",
-    "stateMutability": "payable",
-    "inputs":  [],
     "outputs": []
   }
 ]''')
@@ -144,7 +136,7 @@ def cek_balance():
     ankr_wei = w3.eth.get_balance(WALLET)
     usdt_wei = usdt.functions.balanceOf(WALLET).call()
     ankr_bal = float(w3.from_wei(ankr_wei, "ether"))
-    usdt_bal = float(usdt_wei) / 1e6  # USDT decimals = 6
+    usdt_bal = float(usdt_wei) / 1e6
     log(f"💰 Balance — ANKR: {ankr_bal:.4f} | USDT: {usdt_bal:.4f}")
     return ankr_bal, usdt_bal
 
@@ -177,85 +169,80 @@ def approve_token(token_contract, spender, amount_wei):
 # SWAP FUNCTIONS
 # ════════════════════════════════════════════
 
-def swap_ankr_ke_usdt(ankr_amount):
-    """ANKR native → USDT via V3 multicall"""
-    amount_in = w3.to_wei(ankr_amount, "ether")
-    deadline  = int(time.time()) + 300
-
-    # exactInputSingle: WANKR → USDT, recipient langsung wallet
-    swap_data = router.encode_abi(
+def encode_swap(token_in, token_out, fee, recipient, amount_in):
+    """Encode exactInputSingle params"""
+    return router.encode_abi(
         "exactInputSingle",
         args=[(
-            Web3.to_checksum_address(WANKR_TOKEN),
-            Web3.to_checksum_address(USDT_TOKEN),
-            FEE_TIER,
-            WALLET,      # terima USDT langsung
+            Web3.to_checksum_address(token_in),
+            Web3.to_checksum_address(token_out),
+            fee,
+            Web3.to_checksum_address(recipient),
             amount_in,
-            0,           # amountOutMinimum = 0 (testnet, ok)
-            0            # sqrtPriceLimitX96
+            0,
+            0
         )]
     )
 
-    tx = router.functions.multicall(
-        deadline,
-        [swap_data]
-    ).build_transaction({
-        "chainId":  CHAIN_ID,
-        "value":    amount_in,  # kirim ANKR native
-        "gas":      300000,
-        "gasPrice": w3.eth.gas_price,
-        "from":     WALLET,
-    })
+def swap_ankr_ke_usdt(ankr_amount):
+    """ANKR native → USDT, otomatis coba semua fee tier"""
+    global FEE_TIER
+    amount_in = w3.to_wei(ankr_amount, "ether")
 
-    ok, txh = kirim_tx(tx)
-    log(f"{'✅' if ok else '❌'} ANKR→USDT | {ankr_amount} ANKR | tx: {txh[:16]}...")
-    return ok
+    # Kalau fee tier sudah ditemukan sebelumnya, langsung pakai
+    fees_to_try = [FEE_TIER] if FEE_TIER in FEE_TIERS else FEE_TIERS
+
+    for fee in fees_to_try:
+        deadline = int(time.time()) + 300
+        try:
+            swap_data = encode_swap(WANKR_TOKEN, USDT_TOKEN, fee, WALLET, amount_in)
+            tx = router.functions.multicall(deadline, [swap_data]).build_transaction({
+                "chainId":  CHAIN_ID,
+                "value":    amount_in,
+                "gas":      300000,
+                "gasPrice": w3.eth.gas_price,
+                "from":     WALLET,
+            })
+            ok, txh = kirim_tx(tx)
+            log(f"{'✅' if ok else '❌'} ANKR→USDT | fee={fee} | tx: {txh[:16]}...")
+            if ok:
+                FEE_TIER = fee
+                return True
+            # Kalau gagal, coba fee berikutnya (kecuali sudah pakai fee yang terbukti)
+            if len(fees_to_try) == 1:
+                break
+        except Exception as e:
+            log(f"⚠️  fee={fee} exception: {str(e)[:80]}")
+    return False
 
 def swap_usdt_ke_ankr():
-    """USDT → ANKR native via V3 multicall + unwrapWETH9"""
+    """USDT → ANKR native"""
     usdt_balance = usdt.functions.balanceOf(WALLET).call()
     if usdt_balance == 0:
         log("⚠️  Tidak ada USDT")
         return False
 
     approve_token(usdt, ZOTTO_ROUTER, usdt_balance)
-
     deadline = int(time.time()) + 300
 
-    # Step 1: USDT → WANKR, recipient = router (untuk di-unwrap)
-    swap_data = router.encode_abi(
-        "exactInputSingle",
-        args=[(
-            Web3.to_checksum_address(USDT_TOKEN),
-            Web3.to_checksum_address(WANKR_TOKEN),
-            FEE_TIER,
-            Web3.to_checksum_address(ZOTTO_ROUTER),  # router dulu
-            usdt_balance,
-            0,
-            0
-        )]
-    )
+    try:
+        swap_data   = encode_swap(USDT_TOKEN, WANKR_TOKEN, FEE_TIER,
+                                  ZOTTO_ROUTER, usdt_balance)
+        unwrap_data = router.encode_abi("unwrapWETH9", args=[0, WALLET])
 
-    # Step 2: unwrap WANKR → ANKR native ke wallet
-    unwrap_data = router.encode_abi(
-        "unwrapWETH9",
-        args=[0, WALLET]
-    )
-
-    tx = router.functions.multicall(
-        deadline,
-        [swap_data, unwrap_data]
-    ).build_transaction({
-        "chainId":  CHAIN_ID,
-        "value":    0,
-        "gas":      350000,
-        "gasPrice": w3.eth.gas_price,
-        "from":     WALLET,
-    })
-
-    ok, txh = kirim_tx(tx)
-    log(f"{'✅' if ok else '❌'} USDT→ANKR | tx: {txh[:16]}...")
-    return ok
+        tx = router.functions.multicall(deadline, [swap_data, unwrap_data]).build_transaction({
+            "chainId":  CHAIN_ID,
+            "value":    0,
+            "gas":      350000,
+            "gasPrice": w3.eth.gas_price,
+            "from":     WALLET,
+        })
+        ok, txh = kirim_tx(tx)
+        log(f"{'✅' if ok else '❌'} USDT→ANKR | tx: {txh[:16]}...")
+        return ok
+    except Exception as e:
+        log(f"⚠️  USDT→ANKR exception: {str(e)[:80]}")
+        return False
 
 def update_progress(swap_ke, volume_terkumpul, target):
     persen = min(100, (volume_terkumpul / target) * 100)
@@ -273,6 +260,7 @@ def update_progress(swap_ke, volume_terkumpul, target):
 
 ## 📈 Statistik
 - Total swap: **{swap_ke}x**
+- Fee tier aktif: **{FEE_TIER}**
 """)
 
 # ════════════════════════════════════════════
@@ -298,7 +286,8 @@ def main():
 
     volume_per_putaran = SWAP_AMOUNT_ANKR * HARGA_ANKR_USD * 2
     putaran_dibutuhkan = int(TARGET_VOLUME_USD / volume_per_putaran) + 1
-    log(f"📋 Target: ${TARGET_VOLUME_USD:,} | Estimasi putaran: {putaran_dibutuhkan}x\n")
+    log(f"📋 Target: ${TARGET_VOLUME_USD:,} | Estimasi putaran: {putaran_dibutuhkan}x")
+    log(f"🔍 Akan mencoba fee tier: {FEE_TIERS}\n")
 
     volume_terkumpul = 0.0
     swap_ke = 0
