@@ -29,12 +29,12 @@ RPC_URL = "https://testnet.rpc.neuraprotocol.io"
 CHAIN_ID = 267
 
 # Contract addresses — isi sesuai SETUP_BOT.md
-ZOTTO_ROUTER   = "ISI_ROUTER_ADDRESS_DISINI"   # Zotto Router
-MOLLY_TOKEN    = "ISI_MOLLY_ADDRESS_DISINI"    # Token MOLLY
-WANKR_TOKEN    = "ISI_WANKR_ADDRESS_DISINI"    # Wrapped ANKR (WANKR)
+ZOTTO_ROUTER   = "0x6836F8A9a66ab8430224aa9b4E6D24dc8d7d5d77"   # Zotto Router
+MOLLY_TOKEN    = "0x3A631ee99eF7fE2D248116982b14e7615ac77502"    # Token MOLLY
+WANKR_TOKEN    = "0x422F5Eae5fEE0227FB31F149E690a73C4aD02dB8"    # Wrapped ANKR (WANKR)
 
 # Pengaturan swap
-SWAP_AMOUNT_ANKR = 0.5        # Jumlah ANKR per swap (sesuaikan dengan balance kamu)
+SWAP_AMOUNT_ANKR = 55        # Jumlah ANKR per swap (sesuaikan dengan balance kamu)
 DELAY_ANTAR_SWAP = 15         # Jeda antar swap dalam detik (jangan terlalu cepat)
 TARGET_VOLUME_USD = 1000      # Target volume dalam USD ($1K atau $10K)
 HARGA_ANKR_USD   = 0.04       # Perkiraan harga ANKR/USD (update kalau perlu)
